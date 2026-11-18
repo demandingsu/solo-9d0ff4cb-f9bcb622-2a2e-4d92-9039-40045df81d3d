@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>波形交接台</title>
+<style>
+  :root { --green:#1a7f37; --orange:#bf5b00; --gray:#6e7781; --red:#cf222e; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif;
+         margin: 0; background: #f6f8fa; color: #1f2328; }
+  header { background: #24292f; color: #fff; padding: 12px 20px; }
+  header h1 { margin: 0; font-size: 18px; }
+  main { max-width: 1100px; margin: 16px auto; padding: 0 16px; }
+  section { background: #fff; border: 1px solid #d0d7de; border-radius: 8px;
+            padding: 14px 16px; margin-bottom: 16px; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  textarea { width: 100%; font-family: ui-monospace, monospace; font-size: 12px;
+             border: 1px solid #d0d7de; border-radius: 6px; padding: 8px; }
+  input, select { font-size: 13px; padding: 5px 8px; border: 1px solid #d0d7de;
+                  border-radius: 6px; }
+  button { font-size: 13px; padding: 5px 14px; border: 1px solid #1f2328;
+           background: #1f2328; color: #fff; border-radius: 6px; cursor: pointer; }
+  button.ghost { background: #fff; color: #1f2328; border-color: #d0d7de; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  pre { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px;
+        padding: 10px; font-size: 12px; overflow: auto; max-height: 320px;
+        white-space: pre-wrap; word-break: break-all; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border-bottom: 1px solid #d8dee4; padding: 6px 8px; text-align: left; }
+  th { background: #f6f8fa; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px;
+           font-size: 12px; color: #fff; }
+  .b-active { background: var(--green); }
+  .b-stale  { background: var(--orange); }
+  .b-none   { background: var(--gray); }
+  .ok  { color: var(--green); } .err { color: var(--red); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+         margin-bottom: 8px; }
+  .muted { color: var(--gray); font-size: 12px; }
+  .bar { height: 8px; background: #eaeef2; border-radius: 4px; width: 120px;
+         overflow: hidden; display: inline-block; vertical-align: middle; }
+  .bar > i { display: block; height: 100%; background: var(--green); }
+</style>
+</head>
+<body>
+<header><h1>波形交接台 <span class="muted" style="color:#adb8c4">100 Hz 离线补传 · 10 秒窗交接</span></h1></header>
+<main>
+
+<section>
+  <h2>1. 上传 CSV 片段</h2>
+  <div class="row">
+    <input type="file" id="file" accept=".csv,.txt">
+    <span class="muted">格式:台站,UTC起点(epoch毫秒或ISO-8601),轮次,片段号,振幅序列(空格/分号分隔)。起点须按 10 毫秒对齐。</span>
+  </div>
+  <textarea id="csv" rows="5" placeholder="STA1,2026-11-17T00:00:00.000Z,1,0,12 15 11 ..."></textarea>
+  <div class="row" style="margin-top:8px">
+    <button id="btn-upload">上传</button>
+    <span id="upload-msg"></span>
+  </div>
+  <pre id="upload-result" style="display:none"></pre>
+</section>
+
+<section>
+  <h2>2. 窗口缺口浏览 / 发布</h2>
+  <div class="row">
+    <label>台站 <select id="station"></select></label>
+    <label>从(UTC) <input type="datetime-local" id="from" step="10"></label>
+    <label>到(UTC) <input type="datetime-local" id="to" step="10"></label>
+    <button id="btn-load" class="ghost">查询</button>
+    <span class="muted">单次最多 720 窗(2 小时)</span>
+  </div>
+  <table>
+    <thead><tr>
+      <th>窗口起点 (UTC)</th><th>有效样点</th><th>缺口</th><th>状态</th>
+      <th>版本</th><th>操作</th>
+    </tr></thead>
+    <tbody id="windows-body"><tr><td colspan="6" class="muted">尚未查询</td></tr></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>3. 窗口详情 / 拾取接口视图</h2>
+  <pre id="detail">点击上表"详情"或"拾取读取"查看。</pre>
+</section>
+
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const pad = n => String(n).padStart(2, '0');
+
+function msToInput(ms) {
+  const d = new Date(ms);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+function inputToMs(v) {
+  if (!v) return null;
+  return Date.parse(v.length === 16 ? v + ':00Z' : (v.endsWith('Z') ? v : v + 'Z'));
+}
+function showJson(el, obj) { el.style.display = 'block'; el.textContent = JSON.stringify(obj, null, 2); }
+function summarize(d) {  // 长数组截断显示
+  const c = {...d};
+  for (const k of ['samples', 'rounds']) {
+    if (Array.isArray(c[k]) && c[k].length > 24)
+      c[k] = c[k].slice(0, 24).concat([`... 共${d[k].length}个`]);
+  }
+  return c;
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let body = null;
+  try { body = await r.json(); } catch (e) { /* ignore */ }
+  return { status: r.status, body };
+}
+
+// ---------- 上传 ----------
+$('file').addEventListener('change', async () => {
+  const f = $('file').files[0];
+  if (f) $('csv').value = await f.text();
+});
+
+$('btn-upload').addEventListener('click', async () => {
+  const text = $('csv').value;
+  const msg = $('upload-msg');
+  msg.textContent = '上传中...'; msg.className = '';
+  const { status, body } = await api('/api/upload', { method: 'POST', body: text });
+  showJson($('upload-result'), body);
+  if (status === 200) {
+    msg.textContent = `成功:入库 ${body.inserted} 片,跳过 ${body.skipped} 片,标过期窗 ${body.stale_windows.length} 个`;
+    msg.className = 'ok';
+    await refreshStations();
+    await loadWindows();
+  } else {
+    msg.textContent = `整批拒收(${status}):${body && body.detail ? body.detail : ''}`;
+    msg.className = 'err';
+  }
+});
+
+// ---------- 台站与窗口 ----------
+async function refreshStations() {
+  const { body } = await api('/api/stations');
+  const sel = $('station');
+  const cur = sel.value;
+  sel.innerHTML = '';
+  for (const s of (body.stations || [])) {
+    const o = document.createElement('option');
+    o.value = o.textContent = s;
+    sel.appendChild(o);
+  }
+  if (cur) sel.value = cur;
+}
+
+async function loadWindows() {
+  const st = $('station').value;
+  const lo = inputToMs($('from').value), hi = inputToMs($('to').value);
+  const tbody = $('windows-body');
+  if (!st || lo == null || hi == null) {
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">请选择台站与时间范围</td></tr>';
+    return;
+  }
+  const { status, body } = await api(`/api/windows?station=${encodeURIComponent(st)}&from_ms=${lo}&to_ms=${hi}`);
+  if (status !== 200) {
+    tbody.innerHTML = `<tr><td colspan="6" class="err">查询失败:${body && body.detail || status}</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = '';
+  for (const w of body.windows) {
+    const tr = document.createElement('tr');
+    const pct = Math.round(w.filled / 10);
+    const badge = w.state === 'active' ? '<span class="badge b-active">现役</span>'
+                : w.state === 'stale'  ? '<span class="badge b-stale">已过期</span>'
+                : '<span class="badge b-none">未发布</span>';
+    tr.innerHTML = `
+      <td>${w.start_utc}</td>
+      <td><span class="bar"><i style="width:${pct}%"></i></span> ${w.filled}/1000</td>
+      <td>${w.gaps}</td>
+      <td>${badge}</td>
+      <td>${w.version || '—'}</td>
+      <td></td>`;
+    const td = tr.lastElementChild;
+    const mk = (label, fn, disabled) => {
+      const b = document.createElement('button');
+      b.textContent = label; b.className = 'ghost'; b.disabled = !!disabled;
+      b.style.marginRight = '4px';
+      b.addEventListener('click', fn);
+      td.appendChild(b);
+    };
+    mk('发布', () => publishWindow(st, w.window_start_ms), w.filled < 1000);
+    mk('详情', () => showDetail(st, w.window_start_ms));
+    mk('拾取读取', () => showPicking(st, w.window_start_ms));
+    tbody.appendChild(tr);
+  }
+  if (!body.windows.length)
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">该范围内无窗口</td></tr>';
+}
+
+async function publishWindow(st, wstart) {
+  const { status, body } = await api('/api/publish', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ station: st, window_start_ms: wstart })
+  });
+  showJson($('detail'), { 操作: '发布', HTTP状态: status, 结果: body });
+  await loadWindows();
+}
+
+async function showDetail(st, wstart) {
+  const { body } = await api(`/api/windows/${encodeURIComponent(st)}/${wstart}`);
+  showJson($('detail'), summarize(body));
+}
+
+async function showPicking(st, wstart) {
+  const { status, body } = await api(`/api/picking/${encodeURIComponent(st)}/${wstart}`);
+  showJson($('detail'), { 操作: '拾取接口读取', HTTP状态: status, 结果: summarize(body || {}) });
+}
+
+$('btn-load').addEventListener('click', loadWindows);
+
+// ---------- 初始化 ----------
+(function init() {
+  const now = Date.now();
+  $('from').value = msToInput(now - 30 * 60 * 1000);
+  $('to').value = msToInput(now + 30 * 60 * 1000);
+  refreshStations().then(loadWindows);
+})();
+</script>
+</body>
+</html>
